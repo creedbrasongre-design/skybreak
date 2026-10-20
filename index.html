@@ -181,6 +181,11 @@ button:focus-visible,.padfocus{outline:3px solid var(--rune)!important;outline-o
 .tbtns{right:max(14px,env(safe-area-inset-right,0px));width:min(280px,48vw);height:min(240px,42vw)}
 .tb{position:absolute;border-radius:50%;border:3px solid rgba(255,255,255,.5);background:rgba(26,16,44,.72);color:#fff;font-family:'Russo One',sans-serif;font-size:clamp(16px,2.4vw,22px);display:grid;place-items:center;touch-action:none;box-shadow:0 4px 14px rgba(0,0,0,.45),inset 0 2px 0 rgba(255,255,255,.12);text-shadow:0 2px 2px rgba(0,0,0,.6)}
 .tb.pressed{background:rgba(242,177,74,.9);border-color:#fff;color:#140b1f;transform:scale(.94);box-shadow:0 0 20px rgba(242,177,74,.9),inset 0 2px 0 rgba(255,255,255,.4)}
+.pcard .fsmeter{grid-column:1/-1;height:5px;background:rgba(255,255,255,.08);border-radius:3px;margin-top:4px;overflow:hidden;pointer-events:none}
+.pcard .fsbar{height:100%;width:0;background:linear-gradient(90deg,var(--pc),#ffb648);transition:width .3s ease-out;border-radius:3px}
+.pcard.fsready .fsbar{background:linear-gradient(90deg,#ffd84a,#fff6a8);box-shadow:0 0 10px #ffd84a;animation:fspulse 0.9s ease-in-out infinite;width:100%!important}
+.pcard.fsready{box-shadow:0 0 24px rgba(255,216,74,.65)}
+@keyframes fspulse{0%,100%{opacity:1}50%{opacity:.55}}
 .tb.att{background:rgba(255,84,112,.72);border-color:rgba(255,180,200,.75)}
 .tb.spc{background:rgba(79,169,255,.72);border-color:rgba(180,220,255,.75)}
 .tb.jmp{background:rgba(90,214,122,.72);border-color:rgba(200,255,210,.75)}
@@ -1639,7 +1644,14 @@ function rumble(f, s) {
   if (va && va.playEffect) { try { va.playEffect('dual-rumble', { duration: 70 + s * 140, strongMagnitude: clamp(s, 0.1, 1), weakMagnitude: clamp(s * 0.8, 0.1, 1) }).catch(() => { }); } catch (e) { } }
 }
 // touch
-const isTouch = matchMedia('(pointer:coarse)').matches || 'ontouchstart' in window;
+const isTouch = matchMedia('(pointer: coarse)').matches && (navigator.maxTouchPoints || 0) > 0;
+window.addEventListener('pointerup', () => {
+  for (const k of ['T_up','T_down','T_left','T_right','T_jump','T_att','T_spec','T_shield','T_dodge']) keys.delete(k);
+  document.querySelectorAll('#touch .tb.pressed').forEach(b => b.classList.remove('pressed'));
+});
+// Yield a paint frame before heavy work so the browser can repaint the click
+// feedback first. Keeps Interaction-to-Next-Paint (INP) low on big transitions.
+function defer(fn){ requestAnimationFrame(()=>requestAnimationFrame(fn)); }
 document.querySelectorAll('#touch .tb').forEach(b => {
   const k = b.dataset.k;
   const on = e => { e.preventDefault(); keys.add(k); b.classList.add('pressed'); initAudio(); };
@@ -1742,6 +1754,7 @@ class Fighter {
   place(x) {
     Object.assign(this, { x, y: 0, vx: 0, vy: 0, facing: x < 0 ? 1 : -1, grounded: true, onPlat: MAIN, jumps: this.def.jumps, state: 'idle', move: null, mf: 0,
       hitstun: 0, hitlag: 0, invuln: 0, shieldHP: 100, drop: 0, fastfall: false, landlag: 0, stun: 0, helpless: false, upbUsed: false, sideUsed: false,
+      fsCharge: 0, fsReady: false, fsFlash: 0, fsActive: 0,
       dmg: 0, tumble: false, lastHitBy: null, hitSet: new Set(), ai: null, dodgeT: 0, dodgeInv: 0, airDodged: false, roll: 0,
       buf: { jump: 0, attack: 0, special: 0, dodge: 0, cstick: 0 }, cdx: 0, cdy: 0, rally: 0, sinceHit: 999, charge: 0, vanish: false,
       superSlam: false, rocketAng: Math.PI / 2, tetherTo: null, tpDir: null, prevDir: 0, gliding: false, buffs: {}, held: null, frozen: 0 });
@@ -1795,6 +1808,40 @@ class Fighter {
     for (const k of ['jump', 'attack', 'special', 'dodge']) { if (inp[k + 'P']) Bf[k] = 7; else if (Bf[k] > 0) Bf[k]--; }
     if (inp.cstickP) { Bf.cstick = 7; this.cdx = inp.cdx; this.cdy = inp.cdy; } else if (Bf.cstick > 0) Bf.cstick--;
     if (this.hitlag > 0) { this.hitlag--; return; }
+    // Final Smash: Shield + Special (press) when ready → freeze-frame, screen flash, big AoE hit.
+    if (this.fsReady && !this.fsFlash && !this.fsActive && this.state !== 'dead' && this.state !== 'respawn' && this.stun === 0 && inp.shield && inp.specialP) {
+      this.fsFlash = 24; this.fsReady = false;
+      slowmo = Math.max(slowmo, 36); flash(0.65); shake = Math.max(shake, 0.4); sfx('break');
+      Bf.special = 0;
+    }
+    if (this.fsFlash > 0) {
+      this.fsFlash--;
+      this.vx *= 0.5; if (!this.grounded) this.vy = Math.min(this.vy, 0);
+      if (frame % 2 === 0) FX.burst(this.x, this.y + 1.1, 6, '#ffd84a', 10, 0.4, 18);
+      if (this.fsFlash === 0) {
+        this.fsActive = 60;
+        for (const t of fighters) {
+          if (t === this || t.state === 'dead' || t.state === 'respawn') continue;
+          const dx = t.x - this.x, dy = t.y - this.y;
+          if (Math.hypot(dx, dy * 0.8) < 8.5) {
+            t.dmg = Math.min(999, t.dmg + 42); this.dealt += 42;
+            const dir = Math.sign(dx) || this.facing;
+            t.vx = dir * 30; t.vy = 17;
+            t.hitlag = 20; t.hitstun = 44;
+            t.state = 'air'; t.grounded = false;
+            t.tumble = 120; t.helpless = true;
+            t.lastHitBy = this;
+            FX.rings.spawn(t.x, t.y + 1, 0.5, this.def.glow, 3, 20, 0, 1, 1.5);
+            FX.burst(t.x, t.y + 1, 24, this.def.glow, 14, 0.6, 26);
+          }
+        }
+        shake = Math.max(shake, 1.0); flash(0.5); sfx('boom');
+        FX.rings.spawn(this.x, this.y + 1, 0.9, '#ffd84a', 5, 26, 0, 1, 2.2);
+        FX.burst(this.x, this.y + 1, 40, '#ffd84a', 18, 0.9, 34);
+      }
+      return;
+    }
+    if (this.fsActive > 0) { this.fsActive--; if (frame % 3 === 0) FX.burst(this.x + rand(-0.4, 0.4), this.y + 0.8 + rand(0, 1.2), 2, '#ffd84a', 6, 0.3, 16); }
     if (this.invuln > 0) this.invuln--;
     if (this.drop > 0) this.drop--;
     this.sinceHit++;
@@ -2128,6 +2175,7 @@ class Fighter {
     if (impact < -8) { FX.dust(this.x, this.y, 6, 1); sfx('land'); }
   }
   respawn() {
+    this.fsFlash = 0; this.fsActive = 0;
     this.x = clamp(spawnX(this.idx, Math.max(2, fighters.length)) * 0.5, MAIN.x0 + 1, MAIN.x1 - 1); this.y = 11; this.vx = this.vy = 0;
     this.state = 'respawn'; this.hold = 75; this.invuln = 120; this.dmg = 0; this.move = null; this.helpless = false; this.tumble = false;
     this.grounded = false; this.onPlat = null; this.jumps = this.def.jumps; this.shieldHP = 100; this.lastHitBy = null; this.upbUsed = false; this.sideUsed = false;
@@ -2341,6 +2389,8 @@ function applyHit(a, t, h, dirSign, hx, hy, isProj, m, launch = true) {
   if (h.trip) { tripFighter(t); return; }
   const dmg = h.dmg * pw;
   t.dmg = Math.min(999, t.dmg + dmg); a.dealt += dmg; t.sinceHit = 0;
+  if (a.fsCharge < 100 && !a.fsReady) { a.fsCharge = Math.min(100, a.fsCharge + dmg * 0.40); if (a.fsCharge >= 100) { a.fsReady = true; sfx('break'); } }
+  if (t.fsCharge < 100 && !t.fsReady) { t.fsCharge = Math.min(100, t.fsCharge + dmg * 0.55); if (t.fsCharge >= 100) { t.fsReady = true; sfx('break'); } }
   if (has(a, 'lifesteal')) a.dmg = Math.max(0, a.dmg - dmg * 0.2);
   if (a.buffs && a.buffs.vamp > 0) a.dmg = Math.max(0, a.dmg - dmg * 0.5);
   let kb = (h.base + t.dmg * h.scale) * Math.sqrt(pw) / (t.def.weight * t.mul('weight'));
@@ -3233,6 +3283,10 @@ function slotLabel(p) { return p === 0 ? 'Player 1' : sel.mode === 'cpu' ? 'CPU'
 function enterSelect() {
   if(sel.mode==='online') return enterOnlineSelect();
   mode = 'select'; showScreen('select');
+  defer(buildSelectContent);
+}
+let _gridBuilt = false, _readyBound = false;
+function buildSelectContent() {
   const n = slotCount();
   $('#selOpts').innerHTML = `
     <div class="pillgrp"><span>Fighters</span>${[2,3,4,5,6,7,8].map(k => `<button class="pill ${n === k ? 'on' : ''}" data-count="${k}">${k}</button>`).join('')}</div>
@@ -3242,19 +3296,22 @@ function enterSelect() {
     <button class="ghost" id="itemsBtn">Items: ${FREQ_NAMES[settings.items.freq]}</button>
     <button class="ghost" data-open-controls>Controls</button>
     <button class="ghost" id="backTitle">Back</button>`;
-  $('#grid').innerHTML = ROSTER.map((c, i) => `
-    <button class="tile" data-ci="${i}" style="--tc:${c.glow}" aria-label="${c.name}, ${c.title}">
-      <span class="ini">${c.name[0]}</span>
-      <img data-pid="${c.id}" alt="" ${portraits[c.id] ? `src="${portraits[c.id]}"` : 'style="display:none"'}>
-      <span class="chips"></span>
-      <span class="tn"><span>${c.name}</span></span>
-    </button>`).join('') + `<button class="tile rnd" data-ci="-1" style="--tc:#f2b14a" aria-label="Random fighter"><span class="ini" style="color:#f2b14a">?</span><span class="chips"></span><span class="tn"><span>Random</span></span></button>`;
+  if (!_gridBuilt) {
+    $('#grid').innerHTML = ROSTER.map((c, i) => `
+      <button class="tile" data-ci="${i}" style="--tc:${c.glow}" aria-label="${c.name}, ${c.title}">
+        <span class="ini">${c.name[0]}</span>
+        <img data-pid="${c.id}" alt="" ${portraits[c.id] ? `src="${portraits[c.id]}"` : 'style="display:none"'}>
+        <span class="chips"></span>
+        <span class="tn"><span>${c.name}</span></span>
+      </button>`).join('') + `<button class="tile rnd" data-ci="-1" style="--tc:#f2b14a" aria-label="Random fighter"><span class="ini" style="color:#f2b14a">?</span><span class="chips"></span><span class="tn"><span>Random</span></span></button>`;
+    _gridBuilt = true;
+  }
   renderSlots();
   document.querySelectorAll('#select [data-open-controls]').forEach(b => b.addEventListener('click', openControls));
   $('#backTitle').addEventListener('click', () => { mode = 'title'; showScreen('title'); buildFighters(true); });
   $('#stageBtn').addEventListener('click', openStageScreen);
   $('#itemsBtn').addEventListener('click', openItems);
-  $('#readyBtn').addEventListener('click', () => startMatch());
+  if (!_readyBound) { $('#readyBtn').addEventListener('click', () => { sfx('beep'); showScreen(null); defer(startMatch); }); _readyBound = true; }
   updateSelect();
 }
 function renderSlots() {
@@ -3349,12 +3406,13 @@ function openStageScreen() {
 }
 $('#stageGrid').addEventListener('click', e => {
   const t = e.target.closest('[data-stage]'); if (!t) return;
-  setStage(STAGES[+t.dataset.stage]); buildFighters(true); sfx('beep');
-  mode = 'select'; showScreen('select'); enterSelect();
+  const idx = +t.dataset.stage;
+  sfx('beep'); mode = 'select'; showScreen('select');
+  defer(() => { setStage(STAGES[idx]); buildFighters(true); buildSelectContent(); });
 });
 
 document.querySelectorAll('#title [data-mode]').forEach(b => b.addEventListener('click', () => {
-  initAudio(); sel.mode = b.dataset.mode; defaultSlots(b.dataset.mode); sel.active = 0; enterSelect(); sfx('beep');
+  initAudio(); sfx('beep'); sel.mode = b.dataset.mode; defaultSlots(b.dataset.mode); sel.active = 0; enterSelect();
 }));
 $('#onlineOpen').addEventListener('click',openOnline);
 $('#findRandom').addEventListener('click',findRandomPlayer);
@@ -3363,7 +3421,7 @@ $('#onlineItems').addEventListener('click',()=>openItems());
 $('#onlineSpeed').addEventListener('click',e=>{const b=e.target.closest('[data-online-speed]');if(!b)return;settings.speed=+b.dataset.onlineSpeed;saveSettings();document.querySelectorAll('[data-online-speed]').forEach(x=>x.classList.toggle('on',x===b));});
 $('#onlineBack').addEventListener('click',()=>{closeNet();mode='title';showScreen('title');});
 
-$('#rematchBtn').addEventListener('click',()=>{if(sel.mode==='online'){net.ready=false;net.remoteReady=false;net.inMatch=false;net.disconnected=false;enterSelect();}else startMatch();});
+$('#rematchBtn').addEventListener('click',()=>{sfx('beep');if(sel.mode==='online'){net.ready=false;net.remoteReady=false;net.inMatch=false;net.disconnected=false;enterSelect();}else defer(startMatch);});
 $('#toSelectBtn').addEventListener('click', toSelect);
 $('#quitBtn').addEventListener('click', toSelect);
 $('#resumeBtn').addEventListener('click', togglePause);
@@ -3494,6 +3552,7 @@ function buildHUD() {
       <div class="pname"><span class="slotlab">${hudLabel(f)}</span>${f.def.name}</div>
       <div class="pct"><span class="num">0</span><span class="sym">%</span></div>
       <div class="stocks"></div>
+      <div class="fsmeter"><div class="fsbar"></div></div>
       <div class="pbuffs" id="pb${i}"></div>
     </div>`).join('');
   updateHUD(); updateBuffHUD();
@@ -3511,6 +3570,8 @@ function updateHUD(hitIdx) {
     if (hitIdx === i) { pct.classList.remove('hit'); void pct.offsetWidth; pct.classList.add('hit'); }
     const stockKey=settings.stocks+':'+f.stocks;if(c.dataset.stockKey!==stockKey){c.dataset.stockKey=stockKey;c.querySelector('.stocks').innerHTML=Array.from({length:settings.stocks},(_,s)=>`<i class="${s<f.stocks?'':'gone'}"></i>`).join('');}
     c.classList.toggle('out', f.stocks <= 0);
+    const bar = c.querySelector('.fsbar'); if (bar) bar.style.width = f.fsCharge + '%';
+    c.classList.toggle('fsready', !!f.fsReady);
   });
 }
 function showResults() {
@@ -3596,9 +3657,10 @@ function step() {
   if (mode !== 'fight' && mode !== 'gameset') return;
   if (slowmo > 0) { slowmo--; if (frame % 2) return; }
   const inputs = fighters.map(f => {
-    const h = readInput(f.idx);
     if (mode === 'gameset') return blankInput();
-    return isOnlineSession() ? h : (f.ctrl === 'cpu' ? aiInput(f) : readInput(f.humanSeat >= 0 ? f.humanSeat : 0));
+    if (isOnlineSession()) return readInput(f.idx);
+    if (f.ctrl === 'cpu') return aiInput(f);
+    return readInput(f.humanSeat >= 0 ? f.humanSeat : 0);
   });
   fighters.forEach((f, i) => f.update(inputs[i]));
   updateProjectiles();
